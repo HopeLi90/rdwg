@@ -2348,7 +2348,7 @@ mod tests {
         push(&mut bits, 1, 1); // thickness 0
         push(&mut bits, 1, 1); // BE: bit 1 -> default (0,0,1)
         push_bd(&mut bits, 0.0); // start angle
-        push_bd(&mut bits, 3.14159); // end angle
+        push_bd(&mut bits, std::f64::consts::PI); // end angle
         let data = pack(&bits);
         let mut r = br(&data);
         let mut obj = ParsedObject::default();
@@ -2359,7 +2359,7 @@ mod tests {
                 assert!(approx(center.1, 20.0));
                 assert!(approx(radius, 5.0));
                 assert!(approx(start_angle, 0.0));
-                assert!(approx(end_angle, 3.14159));
+                assert!(approx(end_angle, std::f64::consts::PI));
             }
             other => panic!("expected arc, got {:?}", other),
         }
@@ -3009,7 +3009,7 @@ mod tests {
         push_bd(&mut bits, 0.5); // start_width
         push_bd(&mut bits, 0.5); // end_width
         push_bd(&mut bits, 0.25); // bulge
-        push_bd(&mut bits, 1.5708); // tangent
+        push_bd(&mut bits, std::f64::consts::FRAC_PI_2); // tangent
         let data = pack(&bits);
         let mut r = br(&data);
         let mut obj = ParsedObject::default();

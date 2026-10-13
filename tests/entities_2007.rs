@@ -53,7 +53,7 @@ fn decodes_ellipse_geometry() {
             assert!(approx_pt(*major_axis, (-1220.8656432199, 355.8017603696, 0.0)), "major = {major_axis:?}");
             assert!(approx(*axis_ratio, 0.5120328286), "ratio = {axis_ratio}");
             assert!(approx(*start_angle, 0.0), "start = {start_angle}");
-            assert!(approx(*end_angle, 6.2831853072), "end = {end_angle}");
+            assert!(approx(*end_angle, std::f64::consts::TAU), "end = {end_angle}");
         }
         other => panic!("expected Ellipse, got {:?}", other),
     }

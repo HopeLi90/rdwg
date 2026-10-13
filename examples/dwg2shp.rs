@@ -1063,7 +1063,7 @@ fn write_shapefile(base: &Path, shape_type: i32, feats: &[Feat], encoding: Encod
 
 fn build_dbf(feats: &[Feat], enc: Encoding) -> Vec<u8> {
     let maxext = feats.iter().map(|f| f.ext.len()).max().unwrap_or(0);
-    let n_ext = ((maxext + 249) / 250).max(1);
+    let n_ext = maxext.div_ceil(250).max(1);
 
     // Union of the extension-attribute keys across all features, in
     // first-seen order — one DBF column per dictionary key (e.g. `BSM`,
@@ -1220,6 +1220,19 @@ mod closed_attr_tests {
         };
         let n = pts.len();
         Geometry::LwPolyline { flag, points: pts, bulges: vec![0.0; n] }
+    }
+
+    #[test]
+    fn cass_code_pattern() {
+        // Valid CASS feature codes: digits, optional "-<n>" suffix.
+        assert!(is_cass_code("141121"));
+        assert!(is_cass_code("144301-1"));
+        assert!(is_cass_code("300000"));
+        // Not feature codes: owner names, parcel numbers, empty.
+        assert!(!is_cass_code("张三"));
+        assert!(!is_cass_code("101120JC00025"));
+        assert!(!is_cass_code(""));
+        assert!(!is_cass_code("AB12"));
     }
 
     fn cat_of(g: &Geometry, close: &[String], st: ClosedState) -> Cat {
