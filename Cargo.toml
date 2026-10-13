@@ -1,0 +1,26 @@
+[package]
+name = "dwgparse"
+version = "0.2.0"
+edition = "2021"
+description = "Zero-dependency pure-std parser for the DWG CAD file format (AC1015/2000-2002, AC1018/2004-2006, AC1021/2007-2009, AC1024/2010-2012, AC1027/2013-2017, AC1032/2018-2024 incl. AutoCAD 2020). Extracts layers, entity geometry (incl. POLYLINE/VERTEX, ELLIPSE, 3DFACE, SOLID, MTEXT) and extended attributes (EED / XData)."
+license = "MIT"
+
+[[bin]]
+name = "dwgparse"
+path = "src/main.rs"
+
+[lib]
+name = "dwgparse"
+path = "src/lib.rs"
+
+[profile.release]
+opt-level = 3
+
+[dependencies]
+# CJK codepage support: lets the parser recover text that DWG files store in a
+# legacy single-byte code page (e.g. GBK / code page 936 on Chinese AutoCAD
+# 2000-2006) instead of UTF-8/UTF-16. None of the geometry / EED *structure*
+# decoding depends on it; it is only consulted when turning raw text bytes into
+# a Rust `String`. Without this crate the parser still works, but strings saved
+# in GBK would come out mojibake.
+encoding_rs = "0.8"
