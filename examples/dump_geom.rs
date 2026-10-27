@@ -46,11 +46,11 @@ fn main() -> Result<(), String> {
                 "  [{pad}] #{:>4} layer={:<12} POINT ({:.10},{:.10},{:.10})",
                 o.index, layer, x, y, z
             ),
-            Some(Geometry::Text { ins_pt, height, value }) => println!(
+            Some(Geometry::Text { ins_pt, height, value, .. }) => println!(
                 "  [{pad}] #{:>4} layer={:<12} TEXT @({:.10},{:.10}) h={:.10} \"{}\"",
                 o.index, layer, ins_pt.0, ins_pt.1, height, value
             ),
-            Some(Geometry::MText { ins_pt, height, value }) => println!(
+            Some(Geometry::MText { ins_pt, height, value, .. }) => println!(
                 "  [{pad}] #{:>4} layer={:<12} MTEXT @({:.10},{:.10},{:.10}) h={:.10} \"{}\"",
                 o.index, layer, ins_pt.0, ins_pt.1, ins_pt.2, height, value
             ),

@@ -170,6 +170,7 @@ fn check_all(dwg: &DwgFile, label: &str) {
                 ins_pt,
                 height,
                 value,
+                ..
             } => {
                 bounded(ins_pt.0, "ins_pt.x", &ctx);
                 bounded(ins_pt.1, "ins_pt.y", &ctx);
@@ -181,6 +182,7 @@ fn check_all(dwg: &DwgFile, label: &str) {
                 ins_pt,
                 height,
                 value,
+                ..
             } => {
                 bounded_pt(*ins_pt, "ins_pt", &ctx);
                 bounded(*height, "height", &ctx);

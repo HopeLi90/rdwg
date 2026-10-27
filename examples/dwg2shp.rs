@@ -235,6 +235,20 @@ struct Feat {
     /// dictionary XRECORD chain: `(dictionary key, XRECORD value)` in chain
     /// order — e.g. `("BSM", "610621211000011752")` (标识码).
     attrs: Vec<(String, String)>,
+    /// 颜色索引 — the entity's AutoCAD Colour Index (ACI): e.g. `1` (red),
+    /// `5` (blue), `7` (white/black), `256` (ByLayer), `0` (ByBlock). Output
+    /// is the plain numeric index (no descriptive name).
+    color: String,
+    /// 线型 — the entity's linetype, e.g. `CONTINUOUS` / `DASHED`. `ByLayer`
+    /// when the entity inherits its layer's linetype (no explicit linetype
+    /// handle), or the resolved `LTYPE` name, or the raw handle if unknown.
+    linetype: String,
+    /// 线宽 — the entity's lineweight (DXF group 370) in 1/100 mm, or the
+    /// logical label `ByLayer` / `ByBlock` / `Default` for the reserved codes.
+    lineweight: String,
+    /// 高程 — the entity's elevation (DXF group 38), the Z base for planar
+    /// entities, as a decimal string (empty when none).
+    elevation: String,
     pts: Vec<(f64, f64)>,
 }
 
@@ -396,10 +410,26 @@ fn main() {
     let mut points = Vec::new();
     let mut lines = Vec::new();
     let mut polygons = Vec::new();
-    // handle, cad_code, cass_code, layer, etype, geom(Y/N), attr
-    let mut csv_rows: Vec<(String, String, String, String, String, String, String)> = Vec::new();
+    // handle, cad_code, cass_code, layer, etype, geom(Y/N), attr, color,
+    // linetype, lineweight, elevation, text
+    let mut csv_rows: Vec<(
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+    )> = Vec::new();
     let mut forced_poly = 0usize;
     let mut forced_layers: Vec<String> = Vec::new();
+    // Polygons whose ring collapses to fewer than 3 distinct vertices.
+    let mut degenerate_polys = 0usize;
 
     for obj in &dwg.objects {
         let layer = obj
@@ -413,6 +443,9 @@ fn main() {
         let cass_code = extract_cass_code(obj);
         let cad_code = handle.clone();
         let has_attr = !obj.eed.is_empty() || !obj.xdata.is_empty();
+        // Plain annotation text (MTEXT inline codes stripped) — shared by the
+        // point feature's `TEXT` field and the CSV export.
+        let text_out = entity_text(obj);
 
         // Entities owned by a BLOCK_HEADER are block-definition contents, not
         // standalone drawing entities — emitting them produces stray features
@@ -435,7 +468,7 @@ fn main() {
             // explicit `Closed` / `闭合` attribute when classifying the geometry.
             let attrs = resolve_ext_attributes(&dwg, obj);
             let closed_state = closed_state(&attrs);
-            if let Some((cat, pts, txt, was_forced)) =
+            if let Some((cat, pts, _txt, was_forced)) =
                 geom_classify(g, &layer, &close_layers, closed_state)
             {
                 if was_forced {
@@ -444,22 +477,38 @@ fn main() {
                         forced_layers.push(layer.clone());
                     }
                 }
-                let f = Feat {
-                    cat,
-                    layer: layer.clone(),
-                    etype: etype.clone(),
-                    handle: handle.clone(),
-                    cad_code: cad_code.clone(),
-                    cass_code: cass_code.clone(),
-                    ext: ext.clone(),
-                    txt,
-                    attrs,
-                    pts,
+                // Polygon rings must be shapefile-clean: deduped, explicitly
+                // closed and clockwise. Degenerate rings (fewer than 3 distinct
+                // vertices) are skipped — no GIS can render them.
+                let pts = if cat == Cat::Polygon {
+                    normalize_ring(pts)
+                } else {
+                    Some(pts)
                 };
-                match f.cat {
-                    Cat::Point => points.push(f),
-                    Cat::Line => lines.push(f),
-                    Cat::Polygon => polygons.push(f),
+                if let Some(pts) = pts {
+                    let f = Feat {
+                        cat,
+                        layer: layer.clone(),
+                        etype: etype.clone(),
+                        handle: handle.clone(),
+                        cad_code: cad_code.clone(),
+                        cass_code: cass_code.clone(),
+                        ext: ext.clone(),
+                        txt: text_out.clone(),
+                        attrs,
+                        color: entity_color_index(obj),
+                        linetype: entity_linetype(&dwg, obj),
+                        lineweight: entity_lineweight(obj),
+                        elevation: entity_elevation(obj),
+                        pts,
+                    };
+                    match f.cat {
+                        Cat::Point => points.push(f),
+                        Cat::Line => lines.push(f),
+                        Cat::Polygon => polygons.push(f),
+                    }
+                } else {
+                    degenerate_polys += 1;
                 }
             }
         }
@@ -477,6 +526,11 @@ fn main() {
                 etype.clone(),
                 geom,
                 ext.clone(),
+                entity_color_index(obj),
+                entity_linetype(&dwg, obj),
+                entity_lineweight(obj),
+                entity_elevation(obj),
+                text_out.clone(),
             ));
         }
     }
@@ -515,6 +569,12 @@ fn main() {
         "Force-closed: {} polyline(s) on layer(s) {:?}",
         forced_poly, forced_layers
     );
+    if degenerate_polys > 0 {
+        println!(
+            "Degenerate  : {} polygon(s) skipped (ring has < 3 distinct vertices)",
+            degenerate_polys
+        );
+    }
     println!(
         "DBF encoding : {}  (LDID=0x{:02X}, wrote <stem>.cpg)",
         encoding.cpg(),
@@ -525,6 +585,231 @@ fn main() {
         println!("  wrote {}.shp/.shx/.dbf", w);
     }
     println!("  wrote {}", csv_path.to_string_lossy());
+}
+
+/// Whether `c` is a full-width (CJK) glyph, which advances roughly one em.
+fn is_wide_glyph(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x1100..=0x115F
+            | 0x2E80..=0x303E
+            | 0x3041..=0x33FF
+            | 0x3400..=0x4DBF
+            | 0x4E00..=0x9FFF
+            | 0xA000..=0xA4CF
+            | 0xAC00..=0xD7A3
+            | 0xF900..=0xFAFF
+            | 0xFE30..=0xFE4F
+            | 0xFF00..=0xFF60
+            | 0xFFE0..=0xFFE6
+            | 0x20000..=0x3FFFD
+    )
+}
+
+/// Coarse rendered-width estimate for a text string, in drawing units.
+///
+/// Real advances depend on the font, which DWG does not carry, so this uses a
+/// stable approximation: full-width (CJK) glyphs ≈ 1 em, ASCII ≈ 0.6 em,
+/// whitespace ≈ 0.3 em. Good enough to locate the middle-center of a CAD
+/// annotation without embedding font metrics.
+fn estimate_text_width(s: &str, height: f64) -> f64 {
+    if height <= 0.0 {
+        return 0.0;
+    }
+    s.chars()
+        .map(|c| {
+            let em = if c.is_whitespace() {
+                0.3
+            } else if is_wide_glyph(c) {
+                1.0
+            } else {
+                0.6
+            };
+            em * height
+        })
+        .sum()
+}
+
+/// Translate a local (right, up) offset by `rotation` and add it to an anchor.
+fn rotate_offset(ax: f64, ay: f64, dx: f64, dy: f64, rotation: f64) -> (f64, f64) {
+    if rotation == 0.0 {
+        return (ax + dx, ay + dy);
+    }
+    let (s, c) = rotation.sin_cos();
+    (ax + dx * c - dy * s, ay + dx * s + dy * c)
+}
+
+/// Middle-center of a single-line `TEXT` entity.
+///
+/// `ins_pt` is DXF group 10, `align_pt` group 11. When the justification is not
+/// the default Left/Baseline, group 11 supersedes group 10 as the anchor. The
+/// returned point is the geometric center of the estimated text box, rotated
+/// with the text so angled labels stay centred.
+fn text_middle_center(
+    ins_pt: (f64, f64),
+    height: f64,
+    halign: u16,
+    valign: u16,
+    align_pt: Option<(f64, f64)>,
+    rotation: f64,
+    value: &str,
+) -> (f64, f64) {
+    let h = height.max(0.0);
+    // Aligned/Fit text spans between the two alignment points; its center is
+    // the midpoint raised by half the text height (perpendicular to the span).
+    if halign == 3 || halign == 5 {
+        if let Some(ap) = align_pt {
+            let mid = ((ins_pt.0 + ap.0) / 2.0, (ins_pt.1 + ap.1) / 2.0);
+            let angle = (ap.1 - ins_pt.1).atan2(ap.0 - ins_pt.0);
+            let (s, c) = angle.sin_cos();
+            return (mid.0 - (h / 2.0) * s, mid.1 + (h / 2.0) * c);
+        }
+    }
+    let w = estimate_text_width(value, h);
+    let default_just = halign == 0 && valign == 0;
+    let (ax, ay) = if default_just {
+        ins_pt
+    } else {
+        align_pt.unwrap_or(ins_pt)
+    };
+    let dx = match halign {
+        2 => -w / 2.0,      // Right
+        1 | 4 => 0.0,       // Center / Middle
+        _ => w / 2.0,       // Left (default)
+    };
+    let dy = match valign {
+        2 => 0.0,      // Middle
+        3 => -h / 2.0, // Top
+        _ => h / 2.0,  // Baseline / Bottom
+    };
+    rotate_offset(ax, ay, dx, dy, rotation)
+}
+
+/// Middle-center of a `MTEXT` box.
+///
+/// `ins_pt` is the attachment corner/edge (group 71). The box width comes from
+/// the reference rectangle (group 41) when set, otherwise it is estimated from
+/// the longest line; the box height is estimated from the line count.
+fn mtext_middle_center(
+    ins_pt: (f64, f64, f64),
+    height: f64,
+    attachment: u16,
+    width: f64,
+    rotation: f64,
+    plain: &str,
+) -> (f64, f64) {
+    let h = height.max(0.0);
+    let att = if (1..=9).contains(&attachment) {
+        attachment
+    } else {
+        1
+    };
+    let lines = plain.lines().count().max(1) as f64;
+    let box_h = (lines * h * 1.5).max(h);
+    let box_w = if width > 0.0 {
+        width
+    } else {
+        plain
+            .lines()
+            .map(|l| estimate_text_width(l, h))
+            .fold(0.0, f64::max)
+    };
+    // Column: left (1,4,7) → +w/2; right (3,6,9) → -w/2; center → 0.
+    let dx = match att {
+        1 | 4 | 7 => box_w / 2.0,
+        3 | 6 | 9 => -box_w / 2.0,
+        _ => 0.0,
+    };
+    // Row: top (1,2,3) → -h/2; bottom (7,8,9) → +h/2; middle → 0.
+    let dy = match att {
+        1 | 2 | 3 => -box_h / 2.0,
+        7 | 8 | 9 => box_h / 2.0,
+        _ => 0.0,
+    };
+    rotate_offset(ins_pt.0, ins_pt.1, dx, dy, rotation)
+}
+
+/// Strip MTEXT inline formatting codes, returning the plain text a reader sees.
+///
+/// Handles the common subset used by AutoCAD / CASS annotations: grouping
+/// braces, `\P` paragraph breaks, `\~` non-breaking spaces, escaped braces and
+/// backslashes, toggle codes (`\L \l \O \o \K \k`), and the parameterised
+/// `\<letter><params>;` overrides (font, height, colour, alignment, …).
+fn clean_mtext(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\\' {
+            if i + 1 >= chars.len() {
+                i += 1;
+                continue;
+            }
+            let n = chars[i + 1];
+            match n {
+                '\\' => {
+                    out.push('\\');
+                    i += 2;
+                }
+                '{' => {
+                    out.push('{');
+                    i += 2;
+                }
+                '}' => {
+                    out.push('}');
+                    i += 2;
+                }
+                'P' => {
+                    out.push('\n');
+                    i += 2;
+                }
+                '~' => {
+                    out.push(' ');
+                    i += 2;
+                }
+                // Toggle codes carry no `;` parameter — drop just the escape.
+                'L' | 'l' | 'O' | 'o' | 'K' | 'k' => {
+                    i += 2;
+                }
+                _ if n.is_ascii_alphabetic() => {
+                    // Skip the control word and its optional `;`-terminated
+                    // parameter list (e.g. `\H2.5x;`, `\fArial|b0;`).
+                    i += 2;
+                    while i < chars.len() && chars[i] != ';' {
+                        i += 1;
+                    }
+                    if i < chars.len() {
+                        i += 1;
+                    }
+                }
+                _ => {
+                    i += 2;
+                }
+            }
+        } else if c == '{' || c == '}' {
+            i += 1;
+        } else {
+            out.push(c);
+            i += 1;
+        }
+    }
+    // Normalise runs of spaces but preserve paragraph breaks.
+    out.lines()
+        .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
+/// Plain text of a `TEXT` / `MTEXT` entity (empty for anything else).
+fn entity_text(obj: &dwgparse::ParsedObject) -> String {
+    match &obj.geometry {
+        Some(Geometry::Text { value, .. }) => value.clone(),
+        Some(Geometry::MText { value, .. }) => clean_mtext(value).replace('\n', " "),
+        _ => String::new(),
+    }
 }
 
 /// Map a parsed geometry primitive to (category, 2D points, annotation text,
@@ -561,11 +846,39 @@ fn geom_classify(
     let force = layer_force_polygon(layer, close);
     match g {
         Geometry::Point { x, y, .. } => Some((Cat::Point, vec![(*x, *y)], String::new(), false)),
-        Geometry::Text { ins_pt, value, .. } => {
-            Some((Cat::Point, vec![(ins_pt.0, ins_pt.1)], value.clone(), false))
+        Geometry::Text {
+            ins_pt,
+            height,
+            value,
+            halign,
+            valign,
+            align_pt,
+            rotation,
+        } => {
+            // Anchor the point at the text's *middle-center* rather than its
+            // insertion point, so a GIS label pin lands in the middle of the
+            // annotation instead of its left baseline corner.
+            let center = text_middle_center(
+                *ins_pt, *height, *halign, *valign, *align_pt, *rotation, value,
+            );
+            Some((Cat::Point, vec![center], value.clone(), false))
         }
-        Geometry::MText { ins_pt, value, .. } => {
-            Some((Cat::Point, vec![(ins_pt.0, ins_pt.1)], value.clone(), false))
+        Geometry::MText {
+            ins_pt,
+            height,
+            value,
+            attachment,
+            width,
+            rotation,
+        } => {
+            // MTEXT stores inline formatting codes (`\P`, `\H2.5x;`, `{\f…;}`)
+            // — strip them so the exported `TEXT` field is the plain text a
+            // reader actually sees.
+            let plain = clean_mtext(value);
+            let center = mtext_middle_center(
+                *ins_pt, *height, *attachment, *width, *rotation, &plain,
+            );
+            Some((Cat::Point, vec![center], plain.replace('\n', " "), false))
         }
         Geometry::Insert { ins_pt, .. } => {
             Some((Cat::Point, vec![(ins_pt.0, ins_pt.1)], String::new(), false))
@@ -704,6 +1017,68 @@ fn close_ring(mut pts: Vec<(f64, f64)>) -> Vec<(f64, f64)> {
         }
     }
     pts
+}
+
+/// Tolerance (in drawing units) below which two consecutive ring vertices are
+/// considered the same point. Duplicate vertices / micro-segments make ArcMap's
+/// polygon fill misbehave (degenerate triangles show up when zoomed in).
+const RING_VERTEX_EPS: f64 = 1e-6;
+
+/// Normalise a polygon ring for the ESRI shapefile format:
+///
+/// 1. Drop consecutive duplicate / micro-offset vertices — DWG polylines often
+///    carry repeated vertices, and ArcMap's triangulated fill breaks on them
+///    (the geometry looks scrambled once you zoom in).
+/// 2. Ensure the ring is explicitly closed (first point repeated last).
+/// 3. Force **clockwise** orientation. The shapefile spec marks outer rings CW
+///    (negative shoelace area in a Y-up frame); ArcMap interprets a CCW ring
+///    as a *hole*, which garbles the fill of a single-ring polygon. DWG
+///    polylines wind either way, so this must be normalised here.
+///
+/// Returns `None` when fewer than 3 distinct vertices remain (a degenerate
+/// "polygon" no GIS can render — it is skipped instead of exported).
+fn normalize_ring(pts: Vec<(f64, f64)>) -> Option<Vec<(f64, f64)>> {
+    let mut ring: Vec<(f64, f64)> = Vec::with_capacity(pts.len());
+    for p in pts {
+        if let Some(last) = ring.last() {
+            if (last.0 - p.0).abs() < RING_VERTEX_EPS && (last.1 - p.1).abs() < RING_VERTEX_EPS {
+                continue;
+            }
+        }
+        ring.push(p);
+    }
+    if ring.len() < 3 {
+        return None;
+    }
+    // Close the ring explicitly. The closing vertex is exempt from the dedup
+    // above so an already-closed ring keeps its repeated first point.
+    let (fx, fy) = ring[0];
+    let (lx, ly) = *ring.last().unwrap();
+    if (fx - lx).abs() > RING_VERTEX_EPS || (fy - ly).abs() > RING_VERTEX_EPS {
+        ring.push((fx, fy));
+    } else {
+        // Nearly closed (gap < eps): snap the last vertex exactly onto the
+        // first so the shapefile ring is closed to the bit.
+        let n = ring.len();
+        ring[n - 1] = (fx, fy);
+    }
+    // A renderable closed ring needs 3 *distinct* vertices + the closing point
+    // (e.g. `[(0,0), (1,1), (0,0)]` collapses back to two and is rejected).
+    if ring.len() < 4 {
+        return None;
+    }
+    // Signed (shoelace) area over the closed ring; > 0 means CCW in a Y-up
+    // frame, which the shapefile format reads as a hole.
+    let area: f64 = (0..ring.len() - 1)
+        .map(|i| ring[i].0 * ring[i + 1].1 - ring[i + 1].0 * ring[i].1)
+        .sum::<f64>()
+        * 0.5;
+    if area > 0.0 {
+        // CCW → reverse to CW. ring[0] == ring[last], so a plain reverse keeps
+        // the ring closed and only flips the winding.
+        ring.reverse();
+    }
+    Some(ring)
 }
 
 /// Expand a polyline into its true vertex list, honouring per-segment bulges
@@ -925,6 +1300,44 @@ fn extract_cass_code(obj: &dwgparse::ParsedObject) -> String {
     String::new()
 }
 
+/// Resolve an entity's colour to its ACI index (`COLOR` field) — the plain
+/// numeric AutoCAD Colour Index (red = 1, blue = 5, white/black = 7, ByLayer =
+/// 256, ByBlock = 0). Uses the library's `color_index_value`.
+fn entity_color_index(obj: &dwgparse::ParsedObject) -> String {
+    dwgparse::color_index_value(obj.color)
+}
+
+/// Resolve an entity's lineweight to a string (`LINEWEIGHT` field): the raw
+/// group-370 value in 1/100 mm, or the logical label `ByLayer` / `ByBlock` /
+/// `Default` for the reserved codes.
+fn entity_lineweight(obj: &dwgparse::ParsedObject) -> String {
+    dwgparse::lineweight_label(obj.lineweight)
+}
+
+/// Resolve an entity's elevation to a decimal string (`ELEVATION` field): the
+/// DXF group-38 Z base for planar entities. Empty when the entity carries no
+/// elevation (or has no geometry).
+fn entity_elevation(obj: &dwgparse::ParsedObject) -> String {
+    match obj.elevation {
+        Some(z) => format!("{z}"),
+        None => String::new(),
+    }
+}
+
+/// Resolve an entity's linetype to a human-readable name (`LINETYPE` field).
+///
+/// * no explicit linetype handle → `ByLayer` (inherits the layer's linetype);
+/// * a handle → the resolved `LTYPE` name when known, else the raw `0x…` handle.
+fn entity_linetype(dwg: &DwgFile, obj: &dwgparse::ParsedObject) -> String {
+    match obj.linetype_handle {
+        None => "ByLayer".to_string(),
+        Some(h) => dwg
+            .linetype_name(h)
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| format!("0x{:X}", h)),
+    }
+}
+
 /// A CASS feature code is a run of ASCII digits, optionally followed by a
 /// `-<n>` suffix (e.g. `141121`, `144301-1`). Length 3..=12.
 fn is_cass_code(s: &str) -> bool {
@@ -1096,7 +1509,12 @@ fn build_dbf(feats: &[Feat], enc: Encoding) -> Vec<u8> {
         ("HANDLE".into(), 12),
         ("CADCODE".into(), 12),
         ("CASSCODE".into(), 16),
-        ("TXT".into(), 254),
+        ("COLOR".into(), 8),
+        ("LINETYPE".into(), 24),
+        ("LINEWEIGHT".into(), 8),
+        ("ELEVATION".into(), 16),
+        // Plain annotation text (MTEXT inline formatting codes stripped).
+        ("TEXT".into(), 254),
     ];
     for name in &attr_names {
         fields.push((name.clone(), attr_width(name, feats)));
@@ -1148,6 +1566,10 @@ fn build_dbf(feats: &[Feat], enc: Encoding) -> Vec<u8> {
         b.extend_from_slice(&enc.field(&f.handle, 12));
         b.extend_from_slice(&enc.field(&f.cad_code, 12));
         b.extend_from_slice(&enc.field(&f.cass_code, 16));
+        b.extend_from_slice(&enc.field(&f.color, 8));
+        b.extend_from_slice(&enc.field(&f.linetype, 24));
+        b.extend_from_slice(&enc.field(&f.lineweight, 8));
+        b.extend_from_slice(&enc.field(&f.elevation, 16));
         b.extend_from_slice(&enc.field(&f.txt, 254));
         for name in &attr_names {
             let v = f
@@ -1172,10 +1594,28 @@ fn build_dbf(feats: &[Feat], enc: Encoding) -> Vec<u8> {
     b
 }
 
-fn write_csv(path: &Path, rows: &[(String, String, String, String, String, String, String)]) {
+fn write_csv(
+    path: &Path,
+    rows: &[(
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+    )],
+) {
     let mut s = String::new();
-    s.push_str("HANDLE,CADCODE,CASSCODE,LAYER,ETYPE,GEOM,ATTR\n");
-    for (h, c, cc, l, e, g, a) in rows {
+    s.push_str(
+        "HANDLE,CADCODE,CASSCODE,LAYER,ETYPE,GEOM,ATTR,COLOR,LINETYPE,LINEWEIGHT,ELEVATION,TEXT\n",
+    );
+    for (h, c, cc, l, e, g, a, col, lt, lw, elev, text) in rows {
         s.push_str(&csv_field(h));
         s.push(',');
         s.push_str(&csv_field(c));
@@ -1189,6 +1629,16 @@ fn write_csv(path: &Path, rows: &[(String, String, String, String, String, Strin
         s.push_str(&csv_field(g));
         s.push(',');
         s.push_str(&csv_field(a));
+        s.push(',');
+        s.push_str(&csv_field(col));
+        s.push(',');
+        s.push_str(&csv_field(lt));
+        s.push(',');
+        s.push_str(&csv_field(lw));
+        s.push(',');
+        s.push_str(&csv_field(elev));
+        s.push(',');
+        s.push_str(&csv_field(text));
         s.push('\n');
     }
     write_file(path, s.as_bytes());
@@ -1315,5 +1765,153 @@ mod closed_attr_tests {
         // No matching key -> Absent.
         assert_eq!(closed_state(&[("BSM".into(), "123".into())]), ClosedState::Absent);
         assert_eq!(closed_state(&[]), ClosedState::Absent);
+    }
+}
+
+#[cfg(test)]
+mod text_point_tests {
+    use super::*;
+
+    fn approx(a: (f64, f64), b: (f64, f64)) -> bool {
+        (a.0 - b.0).abs() < 1e-9 && (a.1 - b.1).abs() < 1e-9
+    }
+
+    #[test]
+    fn clean_mtext_strips_inline_codes() {
+        // Font / width / colour overrides and grouping braces disappear.
+        assert_eq!(
+            clean_mtext("{\\W0.8;图斑号：\\fTimes New Roman|b0|i0|c0|p18;3}"),
+            "图斑号：3"
+        );
+        // Paragraph breaks are preserved as newlines.
+        assert_eq!(
+            clean_mtext("{\\fArial|b0;T\\P2.86/1397.43}"),
+            "T\n2.86/1397.43"
+        );
+        // Toggle codes (underline / overline / strike) carry no parameters.
+        assert_eq!(clean_mtext("\\L管道\\l"), "管道");
+        // Escaped braces survive as literal characters.
+        assert_eq!(clean_mtext("\\{A\\}"), "{A}");
+    }
+
+    #[test]
+    fn text_default_justification_uses_half_box_offset() {
+        // Left/Baseline: centre = insertion + (w/2, h/2). "AB" = 2 ASCII
+        // glyphs at 0.6 em each → w = 4.8 for h = 4.
+        let c = text_middle_center((0.0, 0.0), 4.0, 0, 0, None, 0.0, "AB");
+        assert!(approx(c, (2.4, 2.0)), "{c:?}");
+    }
+
+    #[test]
+    fn text_middle_justification_returns_the_alignment_point() {
+        // Middle/Middle: the group-11 point *is* the middle-center.
+        let c = text_middle_center((10.0, 10.0), 4.0, 4, 2, Some((20.0, 20.0)), 0.0, "AB");
+        assert!(approx(c, (20.0, 20.0)), "{c:?}");
+        // Middle/Baseline: x from the alignment point, y raised by h/2.
+        let c = text_middle_center((0.0, 0.0), 4.0, 4, 0, Some((20.0, 20.0)), 0.0, "AB");
+        assert!(approx(c, (20.0, 22.0)), "{c:?}");
+    }
+
+    #[test]
+    fn mtext_attachment_offsets() {
+        // Top-center on a single line: centre sits half a box below the
+        // insertion point, with no horizontal shift.
+        let c = mtext_middle_center((0.0, 0.0, 0.0), 10.0, 2, 100.0, 0.0, "X");
+        assert!(approx(c, (0.0, -7.5)), "{c:?}");
+        // Middle-center: insertion point is already the centre.
+        let c = mtext_middle_center((5.0, 6.0, 0.0), 10.0, 5, 100.0, 0.0, "X");
+        assert!(approx(c, (5.0, 6.0)), "{c:?}");
+        // Top-left: shift right by w/2 and down by box_h/2.
+        let c = mtext_middle_center((0.0, 0.0, 0.0), 10.0, 1, 100.0, 0.0, "X");
+        assert!(approx(c, (50.0, -7.5)), "{c:?}");
+    }
+
+    #[test]
+    fn geometry_text_is_exported_at_middle_center() {
+        // End-to-end through `geom_classify`: a two-line MTEXT must yield a
+        // point at the box centre and the cleaned plain text.
+        let g = Geometry::MText {
+            ins_pt: (0.0, 0.0, 0.0),
+            height: 10.0,
+            value: "{\\fArial|b0;T\\P2.86/1397.43}".to_string(),
+            attachment: 2,
+            width: 100.0,
+            rotation: 0.0,
+        };
+        let (cat, pts, txt, _) = geom_classify(&g, "L", &[], ClosedState::Absent).unwrap();
+        assert_eq!(cat, Cat::Point);
+        assert!(approx(pts[0], (0.0, -15.0)), "{:?}", pts[0]); // 2 lines → box 30
+        assert_eq!(txt, "T 2.86/1397.43");
+    }
+}
+
+#[cfg(test)]
+mod polygon_ring_tests {
+    use super::*;
+
+    fn area(pts: &[(f64, f64)]) -> f64 {
+        (0..pts.len() - 1)
+            .map(|i| pts[i].0 * pts[i + 1].1 - pts[i + 1].0 * pts[i].1)
+            .sum::<f64>()
+            * 0.5
+    }
+
+    #[test]
+    fn ccw_ring_is_reversed_to_clockwise() {
+        // Counter-clockwise square (+100) — the shapefile spec reads this as a
+        // hole, so it must come out clockwise.
+        let ring = vec![(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0), (0.0, 0.0)];
+        let out = normalize_ring(ring).unwrap();
+        assert!(area(&out) < 0.0, "area = {}", area(&out));
+        assert_eq!(out[0], out[out.len() - 1], "ring must stay closed");
+    }
+
+    #[test]
+    fn cw_ring_keeps_its_winding() {
+        let ring = vec![(0.0, 0.0), (0.0, 10.0), (10.0, 10.0), (10.0, 0.0), (0.0, 0.0)];
+        let out = normalize_ring(ring.clone()).unwrap();
+        assert_eq!(out, ring);
+    }
+
+    #[test]
+    fn duplicate_vertices_are_dropped_and_ring_stays_closed() {
+        let ring = vec![
+            (0.0, 0.0),
+            (10.0, 0.0),
+            (10.0, 0.0),  // exact duplicate
+            (10.0, 10.0),
+            (0.0, 10.0),
+            (0.0, 0.0),
+        ];
+        let out = normalize_ring(ring).unwrap();
+        assert_eq!(out.len(), 5, "{out:?}");
+        assert_eq!(out[0], out[out.len() - 1]);
+        for w in out.windows(2) {
+            assert_ne!(w[0], w[1], "consecutive duplicates remain: {out:?}");
+        }
+    }
+
+    #[test]
+    fn unclosed_ring_is_closed() {
+        let ring = vec![(0.0, 0.0), (10.0, 0.0), (10.0, 10.0)];
+        let out = normalize_ring(ring).unwrap();
+        assert_eq!(out.len(), 4);
+        assert_eq!(out[0], out[3]);
+    }
+
+    #[test]
+    fn nearly_closed_ring_snaps_shut() {
+        // A sub-tolerance gap between the first and last vertex is snapped so
+        // the exported ring closes exactly.
+        let ring = vec![(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (1e-9, 1e-9)];
+        let out = normalize_ring(ring).unwrap();
+        assert_eq!(out[0], out[out.len() - 1], "ring must close exactly");
+    }
+
+    #[test]
+    fn degenerate_ring_is_rejected() {
+        // Two distinct points can never form a polygon.
+        assert!(normalize_ring(vec![(0.0, 0.0), (1.0, 1.0), (0.0, 0.0)]).is_none());
+        assert!(normalize_ring(vec![]).is_none());
     }
 }

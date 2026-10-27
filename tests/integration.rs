@@ -165,6 +165,7 @@ fn extracts_text_geometry_and_value() {
             ins_pt,
             height,
             value,
+            ..
         }) => {
             assert!((ins_pt.0 - -50.31873725478131).abs() < 1e-9, "x = {}", ins_pt.0);
             assert!((ins_pt.1 - 134.695759123913).abs() < 1e-9, "y = {}", ins_pt.1);

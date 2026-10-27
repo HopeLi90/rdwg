@@ -59,7 +59,7 @@ fn main() -> Result<(), String> {
                 Some(Geometry::Text { ins_pt, value, .. }) => {
                     println!("TEXT @({:.4},{:.4}) \"{}\"", ins_pt.0, ins_pt.1, value)
                 }
-                Some(Geometry::MText { ins_pt, height, value }) => {
+                Some(Geometry::MText { ins_pt, height, value, .. }) => {
                     println!(
                         "MTEXT @({:.4},{:.4}) h={:.4} \"{}\"",
                         ins_pt.0, ins_pt.1, height, value

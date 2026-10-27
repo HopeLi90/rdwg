@@ -8,7 +8,7 @@ use crate::bitreader::BitReader;
 use crate::xdata::{decode_eed, decode_xdata};
 use crate::{
     r2004, r2007, Color, DictionaryEntry, DwgFile, DwgHandle, Eed, Geometry, LayerInfo,
-    ParsedObject, PolylineHeader, VertexData,
+    LinetypeInfo, ParsedObject, PolylineHeader, VertexData,
 };
 use std::collections::HashMap;
 
@@ -326,6 +326,14 @@ struct EntityFlags {
     has_full_visualstyle: bool,
     has_face_visualstyle: bool,
     has_edge_visualstyle: bool,
+    /// Entity colour (`CMC` on R2000, `ENC` on R2004+ entities). `None` only
+    /// when the common-entity colour block is skipped (never for the entities we
+    /// decode — it is always present).
+    color: Option<Color>,
+    /// Entity lineweight (DXF group 370), read from the common-entity field
+    /// block as a raw `RC`. Carries the reserved codes `0xFF`/`0xFE`/`0xFD`
+    /// (ByLayer/ByBlock/Default) or the lineweight in 1/100 mm.
+    lineweight: Option<u16>,
 }
 
 /// Read the common-entity **handle** stream in the exact conditional order of
@@ -350,6 +358,9 @@ pub struct EntityHandleRefs {
     pub owner: Option<u64>,
     pub xdict: Option<u64>,
     pub reactors: Vec<u64>,
+    /// Linetype handle when the entity carries an explicit linetype
+    /// (`ltype_flags == 3`); `None` means ByLayer.
+    pub linetype: Option<u64>,
 }
 
 fn read_entity_common_handles(
@@ -362,6 +373,7 @@ fn read_entity_common_handles(
         owner: None,
         xdict: None,
         reactors: Vec::new(),
+        linetype: None,
     };
 
     // 1. owner handle — only when entmode == 0.
@@ -402,7 +414,9 @@ fn read_entity_common_handles(
 
     // 6. ltype — 7. material/shadow (R_2007a+) — 8. plotstyle
     if f.ltype_flags == 3 {
-        let _ltype = hr.read_h();
+        let h = hr.read_h();
+        let v = resolve_handle(h, own_handle);
+        refs.linetype = if v == 0 { None } else { Some(v) };
     }
     if f.material_flags == 3 {
         let _material = hr.read_h();
@@ -471,12 +485,12 @@ fn read_common_entity_fields(
         let _has_ds_data = rd.read_b();
     }
 
-    if variant >= EntityVariant::R2004 {
+    let color = if variant >= EntityVariant::R2004 {
         // SINCE(R_2004a): the ENC colour encoding replaces `CMC`.
-        let _color = read_enc_color(rd, str_rd);
+        Some(read_enc_color(rd, str_rd))
     } else {
-        let _color = read_cmc(rd, str_rd, EntityVariant::PreR2004);
-    }
+        Some(read_cmc(rd, str_rd, EntityVariant::PreR2004))
+    };
 
     let _ltype_scale = rd.read_bd1();
     let ltype_flags = rd.read_bb();
@@ -498,7 +512,7 @@ fn read_common_entity_fields(
         };
 
     let _invisible = rd.read_bs();
-    let _linewt = rd.read_rc();
+    let lineweight = rd.read_rc() as u16;
     EntityFlags {
         num_reactors,
         entmode,
@@ -511,6 +525,8 @@ fn read_common_entity_fields(
         has_full_visualstyle,
         has_face_visualstyle,
         has_edge_visualstyle,
+        color,
+        lineweight: Some(lineweight),
     }
 }
 
@@ -661,6 +677,29 @@ fn decode_layer(
         ltype_handle: if ltype.value == 0 { None } else { Some(ltype.value) },
         plotstyle_handle,
     })
+}
+
+/// Decode a `LTYPE` table object's **name** (type 0x39).
+///
+/// A `LTYPE` is a table record, not an entity. Like `LAYER`, it opens with
+/// `common_object_handle_data` followed by `COMMON_TABLE_FLAGS`, whose first
+/// field is the name (`T`). We only need that name so that an entity's
+/// linetype handle can later be resolved to a human-readable name; the rest of
+/// the record (dash lengths, shape references) is skipped. The caller discards
+/// the remainder of the object record, so leaving the stream partially read is
+/// harmless.
+fn decode_linetype_name(
+    rd: &mut BitReader,
+    str_rd: &mut Option<BitReader>,
+    variant: EntityVariant,
+) -> Option<String> {
+    read_object_prologue(rd, variant);
+    let name = read_t(rd, str_rd, variant, variant >= EntityVariant::R2007);
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
 }
 
 /// Decode a `BLOCK_HEADER` table object (type 0x31) — we only need its **name**.
@@ -889,7 +928,12 @@ fn parse_object(file: &[u8], offset: usize, index: usize) -> Option<ParsedObject
         polyline: None,
         dictionary: None,
         xdata: Vec::new(),
+        color: None,
+        linetype_handle: None,
+        linetype: None,
         cloning: None,
+        lineweight: None,
+        elevation: None,
         eed,
     };
 
@@ -913,6 +957,9 @@ fn parse_object(file: &[u8], offset: usize, index: usize) -> Option<ParsedObject
                 obj.layer = Some(layer);
             }
         }
+        0x39 => {
+            obj.linetype = decode_linetype_name(&mut rd, &mut None, EntityVariant::PreR2004);
+        }
         0x4f => {
             decode_xrecord(&mut rd, &mut hr, hs_byte, &mut obj, EntityVariant::PreR2004);
         }
@@ -925,6 +972,9 @@ fn parse_object(file: &[u8], offset: usize, index: usize) -> Option<ParsedObject
             obj.owner_handle = refs.owner;
             obj.xdict_handle = refs.xdict;
             obj.reactors = refs.reactors;
+            obj.color = flags.color;
+            obj.linetype_handle = refs.linetype;
+            obj.lineweight = flags.lineweight;
             match type_code {
                 0x13 => decode_line(&mut rd, &mut obj),
                 0x12 => decode_circle(&mut rd, &mut obj),
@@ -1229,9 +1279,13 @@ fn decode_lwpolyline(rd: &mut BitReader, obj: &mut ParsedObject, dialect: Dialec
     if flag & 4 != 0 {
         let _const_width = rd.read_bd();
     }
-    if flag & 8 != 0 {
-        let _elevation = rd.read_bd();
-    }
+    // Group-38 elevation: present only when the `&8` flag is set; otherwise the
+    // polyline lies on Z = 0 (the vertices are 2D and carry no Z of their own).
+    let elevation = if flag & 8 != 0 {
+        rd.read_bd()
+    } else {
+        0.0
+    };
     if flag & 2 != 0 {
         let _thickness = rd.read_bd();
     }
@@ -1287,6 +1341,7 @@ fn decode_lwpolyline(rd: &mut BitReader, obj: &mut ParsedObject, dialect: Dialec
         points,
         bulges,
     });
+    obj.elevation = Some(elevation);
 }
 
 fn decode_text(
@@ -1296,23 +1351,32 @@ fn decode_text(
     variant: EntityVariant,
 ) {
     let dataflags = rd.read_rc();
-    if dataflags & 0x01 == 0 {
-        let _elevation = rd.read_rd();
-    }
+    let elevation = if dataflags & 0x01 == 0 {
+        rd.read_rd()
+    } else {
+        0.0
+    };
+    obj.elevation = Some(elevation);
     let ins_x = rd.read_rd();
     let ins_y = rd.read_rd();
-    if dataflags & 0x02 == 0 {
-        let _ax = rd.read_dd(ins_x);
-        let _ay = rd.read_dd(ins_y);
-    }
+    // Group 11 (second alignment point), stored as DD deltas relative to the
+    // insertion point. It is the authoritative placement point whenever the
+    // justification is not the default Left/Baseline.
+    let align_pt = if dataflags & 0x02 == 0 {
+        Some((rd.read_dd(ins_x), rd.read_dd(ins_y)))
+    } else {
+        None
+    };
     let _extrusion = rd.read_be();
     let _thickness = rd.read_bt();
     if dataflags & 0x04 == 0 {
         let _oblique = rd.read_rd();
     }
-    if dataflags & 0x08 == 0 {
-        let _rotation = rd.read_rd();
-    }
+    let rotation = if dataflags & 0x08 == 0 {
+        rd.read_rd()
+    } else {
+        0.0
+    };
     let height = rd.read_rd();
     if dataflags & 0x10 == 0 {
         let _width = rd.read_rd();
@@ -1324,16 +1388,16 @@ fn decode_text(
     if dataflags & 0x20 == 0 {
         let _gen = rd.read_bs();
     }
-    if dataflags & 0x40 == 0 {
-        let _horiz = rd.read_bs();
-    }
-    if dataflags & 0x80 == 0 {
-        let _vert = rd.read_bs();
-    }
+    let halign = if dataflags & 0x40 == 0 { rd.read_bs() } else { 0 };
+    let valign = if dataflags & 0x80 == 0 { rd.read_bs() } else { 0 };
     obj.geometry = Some(Geometry::Text {
         ins_pt: (ins_x, ins_y),
         height,
         value: value.clone(),
+        halign,
+        valign,
+        align_pt,
+        rotation,
     });
     obj.text = Some(value);
 }
@@ -1361,24 +1425,30 @@ fn decode_mtext(
 ) {
     let ins_pt = (rd.read_bd(), rd.read_bd(), rd.read_bd());
     let _extrusion = (rd.read_bd(), rd.read_bd(), rd.read_bd());
-    let _x_axis_dir = (rd.read_bd(), rd.read_bd(), rd.read_bd());
-    let _rect_width = rd.read_bd();
+    let x_axis_dir = (rd.read_bd(), rd.read_bd(), rd.read_bd());
+    let rect_width = rd.read_bd();
     if variant >= EntityVariant::R2007 {
         // `rect_height` (DXF group 46) — SINCE(R_2007a).
         let _rect_height = rd.read_bd();
     }
     let height = rd.read_bd();
-    let _attachment = rd.read_bs();
+    let attachment = rd.read_bs();
     let _flow_dir = rd.read_bs();
     let _extents_height = rd.read_bd();
     let _extents_width = rd.read_bd();
     // R2007+ routes every `T` field (entities included) through the object's
     // string stream; R2004 and R2000 keep them inline as `TV`.
     let value = read_t(rd, str_rd, variant, variant >= EntityVariant::R2007);
+    // `x_axis_dir` is the text's local +X direction, so its angle is the box
+    // rotation. A zero vector (unset) yields 0.0 — horizontal text.
+    let rotation = x_axis_dir.1.atan2(x_axis_dir.0);
     obj.geometry = Some(Geometry::MText {
         ins_pt,
         height,
         value: value.clone(),
+        attachment,
+        width: rect_width,
+        rotation,
     });
     obj.text = Some(value);
 }
@@ -1511,6 +1581,7 @@ fn decode_polyline_header(
         is_3d,
         vertex_handles,
     });
+    obj.elevation = Some(elevation);
 }
 
 /// Decode a `VERTEX_2D/3D/MESH/PFACE/PFACE_FACE` point record.
@@ -1681,10 +1752,17 @@ fn build_dwg(version: String, mut objects: Vec<ParsedObject>) -> DwgFile {
     // Build handle -> index and gather layers.
     let mut handle_index: HashMap<u64, usize> = HashMap::new();
     let mut layers: Vec<LayerInfo> = Vec::new();
+    let mut linetypes: Vec<LinetypeInfo> = Vec::new();
     for (i, o) in objects.iter().enumerate() {
         handle_index.insert(o.handle, i);
         if let Some(l) = &o.layer {
             layers.push(l.clone());
+        }
+        if let Some(name) = &o.linetype {
+            linetypes.push(LinetypeInfo {
+                handle: o.handle,
+                name: name.clone(),
+            });
         }
     }
 
@@ -1704,11 +1782,34 @@ fn build_dwg(version: String, mut objects: Vec<ParsedObject>) -> DwgFile {
     // polyline while the (now-consumed) vertices drop out.
     assemble_polylines(&mut objects, &handle_index);
 
+    // Derive elevation (DXF group 38, the Z base) for planar entities whose
+    // geometry carries a shared Z but whose decoder did not set it explicitly.
+    // `LWPOLYLINE` (vertices are 2D) and `TEXT`/`POLYLINE_*` elevation are
+    // already captured in their decoders, so they are left untouched.
+    for o in objects.iter_mut() {
+        if o.elevation.is_none() {
+            o.elevation = match &o.geometry {
+                Some(Geometry::Line { start, .. }) => Some(start.2),
+                Some(Geometry::Point { z, .. }) => Some(*z),
+                Some(Geometry::Circle { center, .. }) => Some(center.2),
+                Some(Geometry::Arc { center, .. }) => Some(center.2),
+                Some(Geometry::MText { ins_pt, .. }) => Some(ins_pt.2),
+                Some(Geometry::Insert { ins_pt, .. }) => Some(ins_pt.2),
+                Some(Geometry::Ellipse { center, .. }) => Some(center.2),
+                Some(Geometry::Solid { elevation, .. }) => Some(*elevation),
+                Some(Geometry::Face3d { corners, .. }) => Some(corners[0].2),
+                Some(Geometry::Polyline { elevation, .. }) => Some(*elevation),
+                _ => None,
+            };
+        }
+    }
+
     let object_count = objects.len();
     DwgFile {
         version,
         object_count,
         layers,
+        linetypes,
         objects,
         handle_index,
         block_names,
@@ -2146,7 +2247,12 @@ fn parse_object_r2007(
         polyline: None,
         dictionary: None,
         xdata: Vec::new(),
+        color: None,
+        linetype_handle: None,
+        linetype: None,
         cloning: None,
+        lineweight: None,
+        elevation: None,
         eed,
     };
 
@@ -2173,6 +2279,9 @@ fn parse_object_r2007(
                 obj.layer = Some(layer);
             }
         }
+        0x39 => {
+            obj.linetype = decode_linetype_name(&mut rd, &mut str_rd, variant);
+        }
         0x4f => {
             decode_xrecord(&mut rd, &mut hr, bitsize / 8, &mut obj, variant);
         }
@@ -2184,6 +2293,9 @@ fn parse_object_r2007(
             obj.owner_handle = refs.owner;
             obj.xdict_handle = refs.xdict;
             obj.reactors = refs.reactors;
+            obj.color = flags.color;
+            obj.linetype_handle = refs.linetype;
+            obj.lineweight = flags.lineweight;
             match type_code {
                 0x13 => decode_line(&mut rd, &mut obj),
                 0x12 => decode_circle(&mut rd, &mut obj),
@@ -2473,7 +2585,7 @@ mod tests {
         let mut obj = ParsedObject::default();
         decode_text(&mut r, &mut None, &mut obj, EntityVariant::PreR2004);
         match obj.geometry {
-            Some(Geometry::Text { ins_pt, height, value }) => {
+            Some(Geometry::Text { ins_pt, height, value, .. }) => {
                 assert!(approx(ins_pt.0, -50.319));
                 assert!(approx(ins_pt.1, 134.696));
                 assert!(approx(height, 5.0));
@@ -2578,6 +2690,8 @@ mod tests {
             has_full_visualstyle: false,
             has_face_visualstyle: false,
             has_edge_visualstyle: false,
+            color: None,
+            lineweight: None,
         };
 
         let mut r = BitReader::new(&with_xdict);

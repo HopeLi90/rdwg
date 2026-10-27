@@ -248,6 +248,138 @@ pub struct LayerInfo {
     pub plotstyle_handle: Option<u64>,
 }
 
+/// A `LTYPE` table record (type 0x39): a named linetype definition
+/// (`CONTINUOUS`, `DASHED`, `CENTER`, …). Entities reference linetypes by
+/// handle; this table lets us resolve that handle back to a human-readable
+/// name for downstream use (e.g. a `LINETYPE` field in a Shapefile).
+#[derive(Debug, Clone)]
+pub struct LinetypeInfo {
+    pub handle: u64,
+    pub name: String,
+}
+
+/// ACI (AutoCAD Colour Index) → conventional English colour name, for indices
+/// 1..=255. Index 0 (`ByBlock`) and 256 (`ByLayer`) are handled by the caller;
+/// indices outside 1..=255 fall back to the palette RGB when a name is needed.
+/// Derived from the standard AutoCAD 256-colour palette (`RGB_PALETTE`): only
+/// the fixed logical names used in CAD UI are given here; the rest are served
+/// through their RGB hex.
+pub fn aci_color_name(index: i16) -> Option<&'static str> {
+    match index {
+        1 => Some("Red"),
+        2 => Some("Yellow"),
+        3 => Some("Green"),
+        4 => Some("Cyan"),
+        5 => Some("Blue"),
+        6 => Some("Magenta"),
+        7 => Some("White/Black"),
+        8 => Some("Gray"),
+        9 => Some("Light Gray"),
+        _ => None,
+    }
+}
+
+/// Build a human-readable label for an entity colour (`CMC`/`ENC`).
+///
+/// * `Some(Color { index: 0 })`    → `ByBlock`
+/// * `Some(Color { index: 256 })`  → `ByLayer`
+/// * `Some(Color { index: n })` (1..=255) → e.g. `1 (Red)` / `7 (White/Black)`
+/// * `None` (colour not decoded)   → empty string
+///
+/// The ACI index is the most portable handle for GIS styling; the parenthetical
+/// name is a convenience.
+pub fn color_description(color: Option<Color>) -> String {
+    let c = match color {
+        Some(c) => c,
+        None => return String::new(),
+    };
+    match c.index {
+        0 => "ByBlock".to_string(),
+        256 => "ByLayer".to_string(),
+        n @ 1..=255 => {
+            if let Some(name) = aci_color_name(n) {
+                format!("{n} ({name})")
+            } else {
+                n.to_string()
+            }
+        }
+        // Out-of-range (should not happen for a valid ACI) — show the raw index.
+        other => other.to_string(),
+    }
+}
+
+/// Build the `COLOR` field value as the raw ACI index — the most portable handle
+/// for GIS styling and the value requested by downstream tooling.
+///
+/// * `Some(Color { index: n })` (0..=255, or 256 = ByLayer) → e.g. `1`, `5`,
+///   `7`, `256`, `0` (ByBlock) — the plain numeric AutoCAD Colour Index.
+/// * `None` (colour not decoded) → empty string.
+///
+/// Unlike [`color_description`], no name is appended; the field carries only the
+/// index (red = 1, blue = 5, white/black = 7, ByLayer = 256, ByBlock = 0).
+pub fn color_index_value(color: Option<Color>) -> String {
+    match color {
+        Some(c) => c.index.to_string(),
+        None => String::new(),
+    }
+}
+
+/// Build the `LINEWEIGHT` field value from a raw group-370 lineweight code.
+///
+/// * `None` (not decoded) → empty string.
+/// * `0xFF` (255) → `ByLayer`, `0xFE` (254) → `ByBlock`, `0xFD` (253) →
+///   `Default` — the reserved codes are written as their logical label.
+/// * any other value → the lineweight in 1/100 mm as a plain number
+///   (e.g. `50` = 0.50 mm, `211` = 2.11 mm).
+pub fn lineweight_label(lw: Option<u16>) -> String {
+    match lw {
+        None => String::new(),
+        Some(0xFF) => "ByLayer".to_string(),
+        Some(0xFE) => "ByBlock".to_string(),
+        Some(0xFD) => "Default".to_string(),
+        Some(n) => n.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod color_tests {
+    use super::*;
+
+    #[test]
+    fn bylayer_and_byblock_labels() {
+        assert_eq!(color_description(Some(Color { index: 256 })), "ByLayer");
+        assert_eq!(color_description(Some(Color { index: 0 })), "ByBlock");
+        assert_eq!(color_description(None), "");
+    }
+
+    #[test]
+    fn aci_index_gets_palette_name() {
+        assert_eq!(color_description(Some(Color { index: 1 })), "1 (Red)");
+        assert_eq!(color_description(Some(Color { index: 7 })), "7 (White/Black)");
+        assert_eq!(color_description(Some(Color { index: 5 })), "5 (Blue)");
+    }
+
+    #[test]
+    fn color_index_value_is_plain_number() {
+        assert_eq!(color_index_value(Some(Color { index: 1 })), "1");
+        assert_eq!(color_index_value(Some(Color { index: 5 })), "5");
+        assert_eq!(color_index_value(Some(Color { index: 7 })), "7");
+        assert_eq!(color_index_value(Some(Color { index: 256 })), "256");
+        assert_eq!(color_index_value(Some(Color { index: 0 })), "0");
+        assert_eq!(color_index_value(None), "");
+    }
+
+    #[test]
+    fn lineweight_label_reserved_and_numeric() {
+        assert_eq!(lineweight_label(Some(255)), "ByLayer");
+        assert_eq!(lineweight_label(Some(254)), "ByBlock");
+        assert_eq!(lineweight_label(Some(253)), "Default");
+        assert_eq!(lineweight_label(Some(50)), "50");
+        assert_eq!(lineweight_label(Some(211)), "211");
+        assert_eq!(lineweight_label(None), "");
+    }
+}
+
 /// One decoded geometry primitive.
 #[derive(Debug, Clone)]
 pub enum Geometry {
@@ -284,6 +416,19 @@ pub enum Geometry {
         ins_pt: (f64, f64),
         height: f64,
         value: String,
+        /// Horizontal justification (DXF group 72): `0`=Left, `1`=Center,
+        /// `2`=Right, `3`=Aligned, `4`=Middle, `5`=Fit.
+        halign: u16,
+        /// Vertical justification (DXF group 73): `0`=Baseline, `1`=Bottom,
+        /// `2`=Middle, `3`=Top.
+        valign: u16,
+        /// Second alignment point (DXF group 11). This is the effective
+        /// placement point whenever `halign != 0 || valign != 0`; `None` for
+        /// default (Left/Baseline) text, where `ins_pt` is authoritative.
+        align_pt: Option<(f64, f64)>,
+        /// Rotation of the text baseline around the anchor, in radians (DXF
+        /// group 50). `0.0` for horizontal text.
+        rotation: f64,
     },
     /// Multi-line text (`MTEXT`, type code `0x2c`). Unlike `Text`, the insertion
     /// point is a full 3D point and the entity carries a rotation given by the
@@ -292,6 +437,17 @@ pub enum Geometry {
         ins_pt: (f64, f64, f64),
         height: f64,
         value: String,
+        /// Attachment point (DXF group 71): `1`=Top-left, `2`=Top-center,
+        /// `3`=Top-right, `4`=Middle-left, `5`=Middle-center, `6`=Middle-right,
+        /// `7`=Bottom-left, `8`=Bottom-center, `9`=Bottom-right. `ins_pt` is
+        /// that corner/edge of the text box.
+        attachment: u16,
+        /// Reference rectangle width (DXF group 41) in drawing units; `<= 0`
+        /// when the MTEXT has no fixed column width.
+        width: f64,
+        /// Rotation of the text box in radians, derived from `x_axis_dir`
+        /// (DXF group 11). `0.0` for horizontal text.
+        rotation: f64,
     },
     Insert {
         ins_pt: (f64, f64, f64),
@@ -448,11 +604,34 @@ pub struct ParsedObject {
     /// per-field `XRECORD` attribute chain.
     pub dictionary: Option<Vec<DictionaryEntry>>,
     pub xdata: Vec<XDataItem>,
+    /// Entity colour (`CMC` on R2000/R2004, `ENC` on R2004+ entities). `None`
+    /// for objects that carry no colour (table records decode their own). Index
+    /// `0` = ByBlock, `256` = ByLayer, `1..=255` = ACI palette index.
+    pub color: Option<Color>,
+    /// Entity linetype handle, captured from the handle stream **only** when the
+    /// entity sets an explicit linetype (`ltype_flags == 3`). `None` means the
+    /// entity inherits the linetype from its layer (ByLayer).
+    pub linetype_handle: Option<u64>,
+    /// Linetype name — set **only** on `LTYPE` table records (0x39) so
+    /// [`DwgFile::linetype_name`] can resolve a handle back to a name.
+    pub linetype: Option<String>,
     /// `cloning` flag of an `XRECORD` (`DXF 280`), read *after* the XData resbuf
     /// chain. It is a property of the XRECORD object itself, **not** a resbuf
     /// group — LibreDWG decodes it as a separate `BS cloning` field and never
     /// folds it into the XData list, so we keep it apart too.
     pub cloning: Option<i16>,
+    /// Entity lineweight (DXF group 370), captured from the common-entity field
+    /// block. `None` when not decoded. Raw codes: `0xFF` (255) = ByLayer,
+    /// `0xFE` (254) = ByBlock, `0xFD` (253) = Default; any other value is the
+    /// lineweight expressed in 1/100 mm (e.g. 50 = 0.50 mm, 211 = 2.11 mm, the
+    /// library default).
+    pub lineweight: Option<u16>,
+    /// Entity elevation (DXF group 38), the Z base for planar entities.
+    /// `None` when the entity carries no elevation (or has no geometry). For an
+    /// `LWPOLYLINE` this is the entity's explicit group-38 value (0.0 when the
+    /// `&8` flag is absent); for other planar entities it is the shared Z of
+    /// their vertices.
+    pub elevation: Option<f64>,
     pub eed: Vec<Eed>,
 }
 
@@ -471,6 +650,9 @@ pub struct DwgFile {
     pub version: String,
     pub object_count: usize,
     pub layers: Vec<LayerInfo>,
+    /// `LTYPE` table records (type 0x39), indexed by handle — used to resolve an
+    /// entity's linetype handle to a name.
+    pub linetypes: Vec<LinetypeInfo>,
     pub objects: Vec<ParsedObject>,
     handle_index: HashMap<u64, usize>,
     /// BLOCK_HEADER handle -> block name (`*Model_Space`, `*Paper_Space`, …).
@@ -499,6 +681,20 @@ impl DwgFile {
     /// Find a layer by its exact name (DWG layer names are case-preserving).
     pub fn layer_by_name(&self, name: &str) -> Option<&LayerInfo> {
         self.layers.iter().find(|l| l.name == name)
+    }
+
+    /// Resolve a linetype handle to its name (e.g. `CONTINUOUS`, `DASHED`).
+    /// Returns `None` if the handle does not refer to a known `LTYPE` record.
+    pub fn linetype_name(&self, handle: u64) -> Option<&str> {
+        let idx = *self.handle_index.get(&handle)?;
+        self.objects
+            .get(idx)
+            .and_then(|o| o.linetype.as_deref())
+    }
+
+    /// Look up a `LTYPE` definition by its exact name.
+    pub fn linetype_by_name(&self, name: &str) -> Option<&LinetypeInfo> {
+        self.linetypes.iter().find(|l| l.name == name)
     }
 
     /// All entities that live on `layer`.

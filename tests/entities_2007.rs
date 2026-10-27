@@ -186,7 +186,7 @@ fn decodes_eighteen_mtexts() {
         })
         .expect("the reference MTEXT must be present");
     match &target.geometry {
-        Some(Geometry::MText { ins_pt, height, value }) => {
+        Some(Geometry::MText { ins_pt, height, value, .. }) => {
             assert!(approx_pt(*ins_pt, (830.4162903179, 10749.3113709571, 0.0)), "{ins_pt:?}");
             assert!(approx(*height, 2.5), "height = {height}");
             assert_eq!(value, "1504,68");

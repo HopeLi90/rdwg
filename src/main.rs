@@ -130,6 +130,7 @@ fn main() {
                 ins_pt,
                 height,
                 value,
+                ..
             }) => {
                 println!(
                     "TEXT @({:.3},{:.3}) h={:.3} \"{}\"",
@@ -140,6 +141,7 @@ fn main() {
                 ins_pt,
                 height,
                 value,
+                ..
             }) => {
                 println!(
                     "MTEXT @({:.3},{:.3},{:.3}) h={:.3} \"{}\"",
